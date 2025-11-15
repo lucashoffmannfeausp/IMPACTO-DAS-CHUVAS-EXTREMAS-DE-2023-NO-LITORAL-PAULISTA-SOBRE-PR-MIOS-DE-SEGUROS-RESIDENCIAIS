@@ -1,0 +1,1489 @@
+## 1. Criação de Base Consolidada e Dessazonalizada dos Inputs da Susep e Demais dados Essenciais
+
+# --- SCRIPT DE CONSOLIDAÇÃO E ANÁLISE DE BASES DE DADOS PARA MONOGRAFIA ---
+
+# --- 0. CONFIGURAÇÃO INICIAL E INSTALAÇÃO/CARREGAMENTO DE PACOTES ---
+
+if (!requireNamespace("tidyverse", quietly = TRUE)) install.packages("tidyverse")
+if (!requireNamespace("lubridate", quietly = TRUE)) install.packages("lubridate")
+if (!requireNamespace("readxl", quietly = TRUE)) install.packages("readxl")
+if (!requireNamespace("readr", quietly = TRUE)) install.packages("readr")
+if (!requireNamespace("bigrquery", quietly = TRUE)) install.packages("bigrquery")
+if (!requireNamespace("DBI", quietly = TRUE)) install.packages("DBI")
+if (!requireNamespace("stringr", quietly = TRUE)) install.packages("stringr")
+if (!requireNamespace("writexl", quietly = TRUE)) install.packages("writexl")
+
+
+library(tidyverse)
+library(lubridate)
+library(readxl)
+library(readr)
+library(bigrquery)
+library(DBI)
+library(stringr)
+library(writexl)
+
+# --- PASSO DE DIAGNÓSTICO: LISTAR ARQUIVOS NO DIRETÓRIO ---
+print("Arquivos no diretório de trabalho do Colab:")
+print(list.files())
+# --- FIM DO DIAGNÓSTICO ---
+
+# --- TABELA DE MAPEAMENTO PARA PADRONIZAR NOMES DE ESTADOS ---
+df_padrao_uf <- tibble(
+  estado_completo = c(
+    "Acre", "Alagoas", "Amapá", "Amazonas", "Bahia", "Ceará", "Distrito Federal",
+    "Espírito Santo", "Goiás", "Maranhão", "Mato Grosso", "Mato Grosso do Sul",
+    "Minas Gerais", "Pará", "Paraíba", "Paraná", "Pernambuco", "Piauí",
+    "Rio de Janeiro", "Rio Grande do Norte", "Rio Grande do Sul", "Rondônia",
+    "Roraima", "Santa Catarina", "São Paulo", "Sergipe", "Tocantins", "Brasil"
+  ),
+  UF = c(
+    "AC", "AL", "AP", "AM", "BA", "CE", "DF", "ES", "GO", "MA", "MT", "MS", "MG",
+    "PA", "PB", "PR", "PE", "PI", "RJ", "RN", "RS", "RO", "RR", "SC", "SP", "SE",
+    "TO", "BR"
+  )
+)
+
+
+# --- 1. CARREGAMENTO E PROCESSAMENTO DA BASE DE DADOS EPE (CONSUMO ELÉTRICO) ---
+
+file_path_epe <- "/Dados_abertos_Consumo_Mensal - 21_06_2025.xlsx"
+sheet_name_epe <- "CONSUMO E NUMCONS SAM UF"
+
+df_epe <- read_excel(file_path_epe, sheet = sheet_name_epe, skip = 0, col_names = TRUE) %>%
+  rename(Consumo_Eletrico = Consumo) %>%
+  mutate(
+    Data = ymd(as.character(Data)),
+    UF = str_to_upper(UF)
+  ) %>%
+  filter(Data >= ymd("20150101")) %>%
+  group_by(Data, UF) %>%
+  summarise(Consumo_Eletrico = sum(Consumo_Eletrico, na.rm = TRUE), .groups = 'drop') %>%
+  arrange(UF, Data)
+
+
+# --- 2. CARREGAMENTO E PROCESSAMENTO DA BASE DE DADOS SNIC (CONSUMO DE CIMENTO) ---
+
+file_path_snic <- "/ipeadata(09-08-2025-06-01).xls"
+sheet_name_snic <- "Séries"
+
+df_snic <- read_excel(file_path_snic, sheet = sheet_name_snic) %>%
+  pivot_longer(
+    cols = 4:ncol(.),
+    names_to = "Periodo_String",
+    values_to = "Consumo_Cimento"
+  ) %>%
+  filter(!is.na(Consumo_Cimento)) %>%
+  mutate(
+    Data = ymd(gsub("\\.", "-", paste0(Periodo_String, "-01"))),
+    estado_completo = Estado
+  ) %>%
+  left_join(df_padrao_uf, by = "estado_completo") %>%
+  select(Data, UF, Consumo_Cimento) %>%
+  filter(UF != "BR", Data >= ymd("2017-01-01")) %>%
+  arrange(UF, Data)
+
+
+# --- 3. CARREGAMENTO E PROCESSAMENTO DA BASE DE DADOS CAGED ---
+
+# --- 3A. Processar dados do CAGED (BigQuery) de 2015 a 2019 ---
+bq_auth()
+project_id <- "dados-caged-para-tcc"
+con <- dbConnect(bigrquery::bigquery(), project = project_id, billing = project_id)
+
+query_caged_agregado <- "
+SELECT
+  ano, mes, sigla_uf,
+  COUNT(CASE WHEN CAST(admitidos_desligados AS INT64) = 1 THEN 1 ELSE NULL END) AS total_admissoes,
+  COUNT(CASE WHEN CAST(admitidos_desligados AS INT64) = 2 THEN 1 ELSE NULL END) AS total_desligamentos
+FROM
+  `basedosdados.br_me_caged.microdados_antigos`
+WHERE
+  ano >= 2015 AND ano <= 2019
+GROUP BY ano, mes, sigla_uf
+ORDER BY ano, mes, sigla_uf
+"
+
+df_caged_bq <- dbGetQuery(con, query_caged_agregado) %>%
+  mutate(Data = ymd(paste0(ano, "-", mes, "-01")),
+         UF = str_to_upper(sigla_uf)) %>%
+  select(Data, UF, Total_Admissoes = total_admissoes, Total_Desligamentos = total_desligamentos) %>%
+  arrange(UF, Data)
+
+dbDisconnect(con)
+
+# --- 3B. Processar dados adicionais do CAGED (planilhas) ---
+file_path_admissoes <- "/Admissões[15-06-2025-10-59].xls"
+file_path_demissoes <- "/Demissões[15-06-2025-11-04].xls"
+sheet_name_caged <- "Séries"
+
+df_admissoes <- read_excel(file_path_admissoes, sheet = sheet_name_caged) %>%
+  pivot_longer(
+    cols = 4:ncol(.),
+    names_to = "Periodo_String",
+    values_to = "Total_Admissoes"
+  ) %>%
+  rename(estado_completo = Estado) %>%
+  mutate(Data = ymd(paste0(gsub("\\.", "-", Periodo_String), "-01"))) %>%
+  left_join(df_padrao_uf, by = "estado_completo") %>%
+  select(Data, UF, Total_Admissoes)
+
+df_demissoes <- read_excel(file_path_demissoes, sheet = sheet_name_caged) %>%
+  pivot_longer(
+    cols = 4:ncol(.),
+    names_to = "Periodo_String",
+    values_to = "Total_Desligamentos"
+  ) %>%
+  rename(estado_completo = Estado) %>%
+  mutate(Data = ymd(paste0(gsub("\\.", "-", Periodo_String), "-01"))) %>%
+  left_join(df_padrao_uf, by = "estado_completo") %>%
+  select(Data, UF, Total_Desligamentos)
+
+df_caged_adicional <- full_join(df_admissoes, df_demissoes, by = c("Data", "UF"))
+
+# --- 3C. Combinar os dados do CAGED (BigQuery e planilhas) ---
+df_caged_final <- bind_rows(df_caged_bq, df_caged_adicional) %>%
+  arrange(UF, Data) %>%
+  mutate(
+    Total_Admissoes = replace_na(Total_Admissoes, 0),
+    Total_Desligamentos = replace_na(Total_Desligamentos, 0)
+  )
+
+
+# --- 4. CARREGAMENTO E PROCESSAMENTO DA BASE DE DADOS SUSEP (PROPORÇÕES) ---
+
+file_path_susep <- "/SES_UF2.csv"
+
+df_susep_raw <- read_csv2(
+  file_path_susep,
+  col_types = cols(
+    damesano = col_double(), ramos = col_character(), UF = col_character(),
+    premio_dir = col_double(), .default = col_guess()
+  )
+) %>%
+  mutate(
+    premio_dir = ifelse(premio_dir < 0, 0, premio_dir),
+    UF = str_to_upper(UF) # Padronizar UF para maiúsculas
+  )
+
+data_inicio_analise <- ymd("2015-01-01")
+
+df_premios_agregados_por_uf <- df_susep_raw %>%
+  mutate(Data = ymd(paste0(damesano, "01"))) %>%
+  filter(Data >= data_inicio_analise) %>%
+  rename(Ramo_Codigo = ramos, Premio_Direto = premio_dir) %>%
+  group_by(Data, UF, Ramo_Codigo) %>%
+  summarise(Premio_Direto_Ramo = sum(Premio_Direto, na.rm = TRUE), .groups = 'drop')
+
+df_premio_mercado_total_por_uf <- df_premios_agregados_por_uf %>%
+  group_by(Data, UF) %>%
+  summarise(Premio_Direto_Mercado_Total = sum(Premio_Direto_Ramo, na.rm = TRUE), .groups = 'drop')
+
+df_susep <- df_premios_agregados_por_uf %>%
+  filter(Ramo_Codigo %in% c("0114", "0982", "1601", "1391")) %>%
+  pivot_wider(
+    id_cols = c(Data, UF),
+    names_from = Ramo_Codigo,
+    values_from = Premio_Direto_Ramo,
+    names_prefix = "Premio_",
+    values_fill = 0
+  ) %>%
+  rename(
+    Premio_0114 = Premio_0114, Premio_0982 = Premio_0982,
+    Premio_1601 = Premio_1601, Premio_1391 = Premio_1391
+  ) %>%
+  left_join(df_premio_mercado_total_por_uf, by = c("Data", "UF")) %>%
+  mutate(
+    Premio_Direto_Mercado_Total = replace_na(Premio_Direto_Mercado_Total, 0),
+    Prop_0114_vs_0982 = ifelse(Premio_0982 != 0, Premio_0114 / Premio_0982, NA),
+    Prop_0114_vs_1601 = ifelse(Premio_1601 != 0, Premio_0114 / Premio_1601, NA),
+    Prop_0114_vs_1391 = ifelse(Premio_1391 != 0, Premio_0114 / Premio_1391, NA),
+    Prop_0114_vs_Total = ifelse(Premio_Direto_Mercado_Total != 0, Premio_0114 / Premio_Direto_Mercado_Total, NA)
+  ) %>%
+  select(Data, UF, Premio_0114, Premio_0982, Premio_1601, Premio_1391, Premio_Direto_Mercado_Total, starts_with("Prop_")) %>%
+  arrange(UF, Data)
+
+
+# --- 5. CARREGAMENTO E PROCESSAMENTO DA BASE DE DADOS BOLSA FAMÍLIA ---
+
+file_path_bolsa_familia <- "/ipeadata(10-08-2025-06-27).xls"
+sheet_name_bolsa_familia <- "Séries"
+
+df_bolsa_familia <- read_excel(file_path_bolsa_familia, sheet = sheet_name_bolsa_familia) %>%
+  pivot_longer(
+    cols = 4:ncol(.),
+    names_to = "Periodo_String",
+    values_to = "Valor_Bolsa_Familia"
+  ) %>%
+  filter(!is.na(Valor_Bolsa_Familia)) %>%
+  mutate(
+    Data = ymd(gsub("\\.", "-", paste0(Periodo_String, "-01"))),
+    estado_completo = Estado
+  ) %>%
+  left_join(df_padrao_uf, by = "estado_completo") %>%
+  select(Data, UF, Valor_Bolsa_Familia) %>%
+  arrange(UF, Data)
+
+
+# --- 6. CARREGAMENTO E PROCESSAMENTO DA SÉRIE DE INFLAÇÃO (IPCA) ---
+file_path_ipca <- "/ipeadata[13-08-2025-10-16].xls"
+sheet_name_ipca <- "Séries"
+
+df_ipca <- read_excel(file_path_ipca, sheet = sheet_name_ipca, skip = 1, col_names = c("Data", "IPCA_Index")) %>%
+  mutate(
+    Data = ymd(paste0(gsub("\\.", "-", Data), "-01"))
+  ) %>%
+  filter(Data >= ymd("2015-01-01")) %>%
+  # AQUI: A correção para re-basear o IPCA para janeiro de 2015
+  mutate(
+    IPCA_Rebased = IPCA_Index / first(IPCA_Index[Data == ymd("2015-01-01")])
+  )
+
+
+# --- 7. COMBINAR TODAS AS BASES DE DADOS EM UM ÚNICO DATAFRAME ---
+
+base_consolidada <- df_epe %>%
+  full_join(df_snic, by = c("Data", "UF")) %>%
+  full_join(df_caged_final, by = c("Data", "UF")) %>%
+  full_join(df_susep, by = c("Data", "UF")) %>%
+  full_join(df_bolsa_familia, by = c("Data", "UF")) %>%
+  full_join(df_ipca, by = "Data") %>%
+  arrange(UF, Data) %>%
+  # Passo de deflação usando o IPCA re-baseado
+  mutate(Valor_Bolsa_Familia_Real = Valor_Bolsa_Familia / IPCA_Rebased) %>%
+  # Manter 'Consumo_Cimento' com NAs, substituindo apenas as outras variáveis por zero.
+  mutate(across(where(is.numeric) & !starts_with("Consumo_Cimento"), ~replace_na(., 0)))
+
+
+# --- 8. DESSAZONALIZAÇÃO EM NÍVEL, DENTRO DA JANELA (ATÉ 2024-11) ---
+
+library(dplyr)
+library(lubridate)
+library(purrr)
+
+# 8.0 corte temporal ANTES de estimar sazonalidade
+cutoff <- as.Date("2024-11-01")
+base_trunc <- base_consolidada %>%
+  filter(Data <= cutoff) %>%
+  mutate(
+    MesNum = month(Data),
+    Mes = factor(MesNum, levels = 1:12,
+                 labels = c("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"),
+                 ordered = FALSE)
+  )
+
+# 8.1 variáveis a ajustar (em nível)
+variaveis_para_transformar <- c(
+  "Consumo_Eletrico", "Consumo_Cimento", "Total_Admissoes", "Total_Desligamentos",
+  "Premio_0114", "Premio_0982", "Premio_1601", "Premio_1391",
+  "Premio_Direto_Mercado_Total", "Valor_Bolsa_Familia_Real"
+)
+
+# 8.2 helper: Y_aj = Y - (média_mês - média_geral) por UF, usando SÓ a janela truncada
+ajusta_sazonalidade <- function(df, var){
+  vname_adj <- paste0(var, "_Ajustado")
+  if (!var %in% names(df)) return(df %>% select(Data, UF))
+
+  df %>%
+    group_by(UF) %>%
+    group_modify(\(.x, .g){
+      y <- .x[[var]]
+      # médias por UF com a MESMA amostra usada no ajuste
+      mu  <- mean(y, na.rm = TRUE)                             # média geral da UF (jan-2015..nov-2024)
+      mm  <- ave(y, .x$Mes, FUN = function(z) mean(z, na.rm = TRUE))  # média por mês (dentro da UF)
+      .x[[vname_adj]] <- ifelse(is.na(y), NA_real_, y - (mm - mu))
+      .x
+    }) %>%
+    ungroup() %>%
+    select(Data, UF, all_of(vname_adj))
+}
+
+vars_existentes <- intersect(variaveis_para_transformar, names(base_trunc))
+
+df_aj <- map(vars_existentes, ~ ajusta_sazonalidade(base_trunc, .x)) %>%
+  reduce(full_join, by = c("Data","UF"))
+
+# --- 9. BASE FINAL: junta os ajustados e (opcional) remove os _Desazonalizado para evitar confusão ---
+
+base_final <- base_trunc %>%
+  left_join(df_aj, by = c("Data","UF"))
+
+# --- 10. DIAGNÓSTICO FINAL DA BASE CONSOLIDADA ---
+
+print("--- Diagnóstico da Base Consolidada Final ---")
+print("Dimensões da base consolidada:")
+print(dim(base_final))
+print("Primeiras 10 linhas da base consolidada:")
+print(head(base_final, 10))
+print("Últimas 10 linhas da base consolidada:")
+print(tail(base_final, 10))
+print("Estrutura da base consolidada:")
+str(base_final)
+
+# --- 11. REMOÇÕES DE COLUNAS ---
+
+  # remover proporções antigas (L, M, N) e também a proporção anterior, se existir
+base_final <- base_final %>%
+  dplyr::select(
+    -dplyr::any_of(c("Prop_0114_vs_0982", "Prop_0114_vs_1601", "Prop_0114_vs_1391",
+                     "Prop_0114Ajustado_vs_0982Ajustado"))
+  ) %>%
+  dplyr::mutate(
+    # Nova proporção: Z / AD
+    Prop_0114Ajustado_vs_TotalMercadoAjustado = dplyr::if_else(
+      is.na(Premio_Direto_Mercado_Total_Ajustado) | Premio_Direto_Mercado_Total_Ajustado == 0,
+      NA_real_,
+      Premio_0114_Ajustado / Premio_Direto_Mercado_Total_Ajustado
+    )
+  )
+
+## 1.1 Salvando Versão em Excel
+
+# Exportar a base final (com desazonalização e padronização)
+writexl::write_xlsx(base_final, "base_final_preview.v7.xlsx")
+
+## 1.2 Sanity Check das Dessazonalizações
+
+library(dplyr)
+check_ce <- base_final %>%
+  mutate(Mes = month(Data)) %>%
+  group_by(UF, Mes) %>%
+  summarise(m = mean(Consumo_Eletrico_Ajustado, na.rm = TRUE),
+            n = sum(!is.na(Consumo_Eletrico_Ajustado)),
+            .groups = "drop") %>%
+  group_by(UF) %>%
+  mutate(mu = weighted.mean(m, w = n, na.rm = TRUE),
+         desvio = m - mu) %>%
+  ungroup()
+
+summary(check_ce$desvio)  # deve ficar muito perto de 0 em toda a distribuição
+
+## 2. Inclusão da série de População e criação das séries per capita
+
+# =====================================================================
+# POP -> mensal por UF (interpolação linear entre julhos, sem extrapolação)
+# + MERGE com mensal
+# - Sem dependência de 'zoo' (usa base R: approx)
+# - Com diagnósticos
+# =====================================================================
+
+# Pacotes (instala se faltar)
+if (!require(readxl))    install.packages("readxl", quiet = TRUE)
+if (!require(dplyr))     install.packages("dplyr", quiet = TRUE)
+if (!require(tidyr))     install.packages("tidyr", quiet = TRUE)
+if (!require(lubridate)) install.packages("lubridate", quiet = TRUE)
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+
+# ---------------------------------------------------------------------
+# Caminhos
+# ---------------------------------------------------------------------
+path_pop  <- "/ipeadata(07-09-2025-06-34).xlsx"   # IPEA (julho/ano) -> Fonte externa, mantido.
+
+stopifnot(file.exists(path_pop))
+
+# ---------------------------------------------------------------------
+# 1) Ler POP (Séries em JULHO/ano)
+# ---------------------------------------------------------------------
+
+pop_sheet <- {
+  sh <- readxl::excel_sheets(path_pop)
+  if ("Séries" %in% sh) "Séries" else sh[1]
+}
+
+message(">> Lendo planilha POP (aba = ", pop_sheet, ")")
+pop_raw <- read_excel(path_pop, sheet = pop_sheet)
+
+# Normalizar nomes de colunas (leve, sem janitor)
+names(pop_raw) <- gsub("\\s+", "_", names(pop_raw))
+names(pop_raw) <- gsub("[^A-Za-z0-9_]", "", names(pop_raw))
+names(pop_raw) <- tolower(names(pop_raw))
+
+# Detectar colunas de ano (aceita "2015" ou "x2015")
+year_cols <- names(pop_raw)[grepl("^(x)?\\d{4}$", names(pop_raw))]
+if (length(year_cols) == 0) {
+  stop("Não encontrei colunas de anos como '2015' ou 'x2015'. Verifique o arquivo do IPEA.")
+}
+
+# Checar coluna de UF (sigla)
+if (!"sigla" %in% names(pop_raw)) {
+  stop("Coluna 'sigla' (UF) não encontrada na planilha POP após normalização de nomes.")
+}
+if (!"estado" %in% names(pop_raw)) pop_raw$estado <- NA_character_
+if (!"codigo" %in% names(pop_raw)) pop_raw$codigo <- NA
+
+# Longo: ponto anual em 1º de julho
+pop_long <- pop_raw %>%
+  pivot_longer(
+    cols = all_of(year_cols),
+    names_to = "ano_raw",
+    values_to = "populacao"
+  ) %>%
+  mutate(
+    ano      = as.integer(sub("^x", "", ano_raw)),
+    data_ref = suppressWarnings(ymd(paste0(ano, "-07-01")))
+  ) %>%
+  select(sigla, codigo, estado, ano, data_ref, populacao)
+
+# Converter população para numérico com segurança (se vier como texto)
+pop_long <- pop_long %>%
+  mutate(
+    populacao = if (is.numeric(populacao)) populacao else {
+      as.numeric(gsub("\\.", "", gsub(",", ".", as.character(populacao))))
+    }
+  )
+
+# Checagens
+if (any(is.na(pop_long$data_ref))) {
+  stop("Falha ao criar datas de referência (data_ref). Cheque a coluna de anos.")
+}
+if (all(is.na(pop_long$populacao))) {
+  stop("Todos os valores de população estão NA após conversão. Verifique formatação numérica no arquivo .xls.")
+}
+
+message(">> POP pontos (julho): ", nrow(pop_long), " linhas; UFs: ", length(unique(pop_long$sigla)))
+
+# ---------------------------------------------------------------------
+# 2) Interpolação linear mensal entre julhos por UF (sem extrapolar)
+# ---------------------------------------------------------------------
+
+# Gera meses entre o primeiro e o último julho observados de cada UF
+pop_monthly <- pop_long %>%
+  group_by(sigla, codigo, estado) %>%
+  summarise(
+    min_ref = min(data_ref, na.rm = TRUE),
+    max_ref = max(data_ref, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  rowwise() %>%
+  mutate(data = list(seq(from = min_ref, to = max_ref, by = "month"))) %>%
+  ungroup() %>%
+  select(-min_ref, -max_ref) %>%
+  unnest(data) %>%
+  # anexar os pontos exatos de julho
+  left_join(pop_long %>% select(sigla, data_ref, populacao),
+            by = c("sigla" = "sigla", "data" = "data_ref")) %>%
+  group_by(sigla, codigo, estado) %>%
+  arrange(data, .by_group = TRUE) %>%
+  # Interpolar na base R (approx), sem extrapolar (rule=1)
+  mutate(
+    Populacao = {
+      xi <- as.numeric(data)
+      yi <- populacao
+      ok <- !is.na(yi)
+      if (sum(ok) >= 2) {
+        approx(x = xi[ok], y = yi[ok], xout = xi, rule = 1, ties = "ordered")$y
+      } else {
+        # Se não há pelo menos 2 pontos de julho, não dá pra interpolar -> tudo NA
+        rep(NA_real_, length(xi))
+      }
+    },
+    Populacao = as.numeric(round(Populacao, 0))
+  ) %>%
+  ungroup() %>%
+  transmute(
+    UF     = toupper(sigla),
+    Estado = estado,
+    Codigo = codigo,
+    Data   = as_date(data),
+    Populacao
+  )
+
+# Diagnóstico rápido da interpolação
+diag_interp <- pop_monthly %>%
+  group_by(UF) %>%
+  summarise(
+    n_mes = n(),
+    na_mes = sum(is.na(Populacao)),
+    pct_na = round(100*na_mes/n_mes, 1),
+    .groups = "drop"
+  ) %>% arrange(desc(pct_na))
+
+message(">> Interpolação feita. UFs com maior % de NA (não extrapolamos):")
+print(head(diag_interp, 10))
+
+# ---------------------------------------------------------------------
+# 3) Ler base mensal e MERGE
+# ---------------------------------------------------------------------
+
+if (!exists("base_final")) {
+  stop("O objeto 'base_final' não foi encontrado. Certifique-se de que o primeiro script foi executado antes deste.")
+}
+message(">> Usando o dataframe 'base_final' que já está na memória...")
+base_main <- base_final
+
+# Detectar nomes de UF/Data
+uf_col <- if ("UF" %in% names(base_main)) "UF" else if ("uf" %in% names(base_main)) "uf" else NA
+dt_col <- if ("Data" %in% names(base_main)) "Data" else if ("data" %in% names(base_main)) "data" else NA
+if (is.na(uf_col) || is.na(dt_col)) {
+  stop("Não encontrei colunas de UF e/ou Data na base. Verifique os nomes das colunas.")
+}
+
+# Garantir tipos
+base_main[[uf_col]] <- toupper(as.character(base_main[[uf_col]]))
+base_main[[dt_col]] <- as_date(base_main[[dt_col]])
+
+# Join por UF + Data
+by_vec <- c(); by_vec[uf_col] <- "UF"; by_vec[dt_col] <- "Data"
+
+base_merged <- base_main %>%
+  left_join(pop_monthly %>% select(UF, Data, Populacao), by = by_vec)
+
+# ---------------------------------------------------------------------
+# 4) Salvar e mostrar amostras
+# ---------------------------------------------------------------------
+out_pop_csv  <- "/content/populacao_mensal_por_UF.csv"
+out_base_csv <- "/content/base_com_populacao.csv"
+
+write.csv(pop_monthly, out_pop_csv,  row.names = FALSE)
+write.csv(base_merged, out_base_csv, row.names = FALSE)
+
+message(">> Arquivos gerados:")
+message(" - ", out_pop_csv)
+message(" - ", out_base_csv)
+
+# Amostras
+print(head(pop_monthly %>% arrange(UF, Data), 12))
+print(head(base_merged %>% select(all_of(dt_col), all_of(uf_col), Populacao) %>%
+             arrange(.data[[uf_col]], .data[[dt_col]]), 20))
+
+## 2.1 Gerando arquivo com população
+
+# Instalar caso ainda não tenha
+# install.packages("openxlsx")
+install.packages("openxlsx")
+library(openxlsx)
+
+# Exportar CSVs (como já estava)
+write.csv(pop_monthly, "/content/populacao_mensal_por_UF.csv", row.names = FALSE)
+write.csv(base_merged, "/content/base_com_populacao.csv", row.names = FALSE)
+
+# === Exportar também em Excel (.xlsx) ===
+write.xlsx(base_merged, "/content/base_com_populacao.xlsx")
+
+cat("Arquivos gerados em /content/ :\n",
+    "- populacao_mensal_por_UF.csv\n",
+    "- base_com_populacao.csv\n",
+    "- base_com_populacao.xlsx\n")
+
+## 4.2 Gerando arquivo com variáveis per capita
+
+library(readxl)
+library(dplyr)
+library(openxlsx)  # se não tiver: install.packages("openxlsx")
+
+# Caminhos
+in_path  <- "/content/base_com_populacao.xlsx"
+out_xlsx <- "/content/base_com_populacao_per_capita.xlsx"
+out_csv  <- "/content/base_com_populacao_per_capita.csv"
+out_xlsx2 <- "/content/base_com_populacao_per_capita_v2.xlsx"
+
+# Ler
+df <- read_excel(in_path)
+
+# Colunas necessárias
+req_cols <- c(
+  "Populacao",
+  "Consumo_Eletrico_Ajustado",
+  "Consumo_Cimento_Ajustado",
+  "Total_Admissoes_Ajustado",
+  "Total_Desligamentos_Ajustado",
+  "Premio_0114_Ajustado",
+  "Premio_Direto_Mercado_Total_Ajustado",
+  "Valor_Bolsa_Familia_Real_Ajustado"
+)
+missing <- setdiff(req_cols, names(df))
+if (length(missing) > 0) {
+  stop("Colunas ausentes na base: ", paste(missing, collapse = ", "))
+}
+
+# Criar séries per capita
+df_pc <- df %>%
+  mutate(
+    Consumo_Eletrico_pc     = ifelse(Populacao > 0, Consumo_Eletrico_Ajustado / Populacao, NA_real_),
+    Consumo_Cimento_pc      = ifelse(Populacao > 0, Consumo_Cimento_Ajustado / Populacao, NA_real_),
+    Admissoes_pc            = ifelse(Populacao > 0, Total_Admissoes_Ajustado / Populacao, NA_real_),
+    Demissoes_pc            = ifelse(Populacao > 0, Total_Desligamentos_Ajustado / Populacao, NA_real_),
+    Bolsa_Familia_pc        = ifelse(Populacao > 0, Valor_Bolsa_Familia_Real_Ajustado / Populacao, NA_real_),
+    Premio_0114_pc          = ifelse(Populacao > 0, Premio_0114_Ajustado / Populacao, NA_real_),
+    Premio_Mercado_Total_pc = ifelse(Populacao > 0, Premio_Direto_Mercado_Total_Ajustado / Populacao, NA_real_)
+  )
+
+# Salvar em CSV e Excel
+write.csv(df_pc, out_csv, row.names = FALSE)
+write.xlsx(df_pc, out_xlsx)
+write.xlsx(df_pc, out_xlsx2)   # <<< nova planilha extra
+
+cat("Arquivos gerados:\n",
+    "- ", out_csv, "\n",
+    "- ", out_xlsx, "\n",
+    "- ", out_xlsx2, "\n", sep = "")
+
+
+## 2.3 Estatísticas Descritivas
+
+# =============================================================================
+# Gráficos temporais per capita — geral e por região
+# Base: df_pc
+# Início: 2017
+# Saídas: PDF geral + PDF por região
+# =============================================================================
+
+library(dplyr)
+library(ggplot2)
+library(readxl)
+library(RColorBrewer)
+
+# --- Caminhos ---
+in_xlsx <- "/content/base_com_populacao_per_capita_v2.xlsx"
+out_pdf_all <- "/content/estatisticas_temporais_geral.pdf"
+out_pdf_region <- "/content/estatisticas_temporais_por_regiao"
+
+dir.create(out_pdf_region, showWarnings = FALSE)
+
+# --- Ler base ---
+df_pc <- read_excel(in_xlsx) %>%
+  mutate(Data = as.Date(Data),
+         UF   = toupper(UF)) %>%
+  filter(lubridate::year(Data) >= 2017)
+
+# --- Definir regiões (exemplo simplificado) ---
+regioes <- list(
+  Norte = c("AC","AP","AM","PA","RO","RR","TO"),
+  Nordeste = c("AL","BA","CE","MA","PB","PE","PI","RN","SE"),
+  CentroOeste = c("DF","GO","MT","MS"),
+  Sudeste = c("ES","MG","RJ","SP"),
+  Sul = c("PR","RS","SC")
+)
+
+# --- Variáveis per capita e unidades ---
+vars_pc <- c(
+  "Consumo_Eletrico_pc",
+  "Consumo_Cimento_pc",
+  "Admissoes_pc",
+  "Demissoes_pc",
+  "Bolsa_Familia_pc",
+  "Premio_0114_pc",
+  "Premio_Mercado_Total_pc"
+)
+
+units <- c(
+  "MWh per capita",
+  "Toneladas per capita",
+  "Pessoas per capita",
+  "Pessoas per capita",
+  "Mil R$ per capita",
+  "R$ per capita",
+  "R$ per capita"
+)
+names(units) <- vars_pc
+
+# --- 1) PDF geral ---
+pdf(out_pdf_all, width = 14, height = 8)
+
+for (var in vars_pc) {
+  p <- ggplot(df_pc, aes(x = Data, y = .data[[var]], color = UF)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 1, alpha = 0.6) +
+    theme_minimal(base_size = 14) +
+    scale_x_date(date_breaks = "6 months", date_labels = "%b-%Y") +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.05))) +
+    labs(
+      title = paste("Evolução de", var, "por estado (per capita)"),
+      subtitle = paste("Unidade:", units[[var]]),
+      x = "Data",
+      y = units[[var]],
+      color = "Estado"
+    ) +
+    theme(legend.position = "bottom", axis.text.x = element_text(angle = 45, hjust = 1))
+
+  print(p)
+}
+dev.off()
+cat("PDF geral gerado em:", out_pdf_all, "\n")
+
+# --- 2) PDF por região ---
+for (reg in names(regioes)) {
+  estados_reg <- regioes[[reg]]
+  df_sub <- df_pc %>% filter(UF %in% estados_reg)
+
+  out_pdf_reg <- file.path(out_pdf_region, paste0("estatisticas_", reg, ".pdf"))
+  pdf(out_pdf_reg, width = 14, height = 8)
+
+  n_estados <- length(estados_reg)
+  cores <- colorRampPalette(brewer.pal(8, "Set2"))(n_estados)
+
+  for (var in vars_pc) {
+    p <- ggplot(df_sub, aes(x = Data, y = .data[[var]], color = UF)) +
+      geom_line(linewidth = 1) +
+      geom_point(size = 1, alpha = 0.6) +
+      theme_minimal(base_size = 14) +
+      scale_color_manual(values = cores) +
+      scale_x_date(date_breaks = "6 months", date_labels = "%b-%Y") +
+      scale_y_continuous(expand = expansion(mult = c(0.02, 0.05))) +
+      labs(
+        title = paste("Evolução de", var, "—", reg, "(per capita)"),
+        subtitle = paste("Unidade:", units[[var]]),
+        x = "Data",
+        y = units[[var]],
+        color = "Estado"
+      ) +
+      theme(legend.position = "bottom", axis.text.x = element_text(angle = 45, hjust = 1))
+
+    print(p)
+  }
+
+  dev.off()
+  cat("PDF da região", reg, "gerado em:", out_pdf_reg, "\n")
+}
+
+cat("\nConcluído: PDFs gerais e por região gerados.\n")
+
+## 2.4 Gráficos de População e Inflação
+
+# =============================================================================
+# Gráficos temporais para TCC
+# - Séries per capita, população e IPCA acumulado
+# - Base: df_pc (ajustada anteriormente)
+# - Início: 2017
+# =============================================================================
+
+library(dplyr)
+library(ggplot2)
+library(readxl)
+library(RColorBrewer)
+
+# --- Caminhos ---
+in_xlsx <- "/content/base_com_populacao_per_capita_v2.xlsx"
+out_dir <- "/content/plots_temporais"
+dir.create(out_dir, showWarnings = FALSE)
+
+out_pdf_percapita <- file.path(out_dir, "per_capita_geral.pdf")
+out_pdf_pop <- file.path(out_dir, "populacao_por_regiao.pdf")
+out_pdf_ipca <- file.path(out_dir, "ipca_nacional.pdf")
+
+# --- Ler base ---
+df_pc <- readxl::read_excel(in_xlsx) %>%
+  mutate(Data = as.Date(Data),
+         UF   = toupper(UF)) %>%
+  filter(lubridate::year(Data) >= 2017)
+
+# --- Definir regiões ---
+regioes <- list(
+  Norte = c("AC","AP","AM","PA","RO","RR","TO"),
+  Nordeste = c("AL","BA","CE","MA","PB","PE","PI","RN","SE"),
+  CentroOeste = c("DF","GO","MT","MS"),
+  Sudeste = c("ES","MG","RJ","SP"),
+  Sul = c("PR","RS","SC")
+)
+
+# --- 1) Gráficos séries per capita (PDF geral) ---
+vars_pc <- c(
+  "Consumo_Eletrico_pc",
+  "Consumo_Cimento_pc",
+  "Admissoes_pc",
+  "Demissoes_pc",
+  "Bolsa_Familia_pc",
+  "Premio_0114_pc",
+  "Premio_Mercado_Total_pc"
+)
+
+units_pc <- c(
+  "MWh per capita",
+  "Toneladas per capita",
+  "Pessoas per capita",
+  "Pessoas per capita",
+  "Mil R$ per capita",
+  "R$ per capita",
+  "R$ per capita"
+)
+names(units_pc) <- vars_pc
+
+pdf(out_pdf_percapita, width = 14, height = 8)
+for (var in vars_pc) {
+  p <- ggplot(df_pc, aes(x = Data, y = .data[[var]], color = UF)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 1, alpha = 0.6) +
+    theme_minimal(base_size = 14) +
+    scale_x_date(date_breaks = "6 months", date_labels = "%b-%Y") +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.05))) +
+    labs(
+      title = paste("Evolução de", var, "por estado (per capita)"),
+      subtitle = paste("Unidade:", units_pc[[var]]),
+      x = "Data",
+      y = units_pc[[var]],
+      color = "Estado"
+    ) +
+    theme(legend.position = "bottom", axis.text.x = element_text(angle = 45, hjust = 1))
+
+  print(p)
+}
+dev.off()
+cat("PDF séries per capita gerado em:", out_pdf_percapita, "\n")
+
+# --- 2) Gráficos de população por região ---
+pdf(out_pdf_pop, width = 14, height = 8)
+for (reg in names(regioes)) {
+  estados_reg <- regioes[[reg]]
+  df_sub <- df_pc %>% filter(UF %in% estados_reg)
+
+  n_estados <- length(estados_reg)
+  cores <- colorRampPalette(brewer.pal(8, "Set2"))(n_estados)
+
+  p <- ggplot(df_sub, aes(x = Data, y = Populacao, color = UF)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 1, alpha = 0.6) +
+    theme_minimal(base_size = 14) +
+    scale_color_manual(values = cores) +
+    scale_x_date(date_breaks = "6 months", date_labels = "%b-%Y") +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.05))) +
+    labs(
+      title = paste("Evolução da População —", reg),
+      subtitle = "Unidade: habitantes",
+      x = "Data",
+      y = "População",
+      color = "Estado"
+    ) +
+    theme(legend.position = "bottom", axis.text.x = element_text(angle = 45, hjust = 1))
+
+  print(p)
+}
+dev.off()
+cat("PDF população por região gerado em:", out_pdf_pop, "\n")
+
+# --- 3) Gráfico nacional do IPCA acumulado ---
+pdf(out_pdf_ipca, width = 10, height = 6)
+ggplot(df_pc, aes(x = Data, y = IPCA_Index)) +
+  geom_line(color = "steelblue", linewidth = 1.2) +
+  geom_point(color = "steelblue", size = 1, alpha = 0.6) +
+  theme_minimal(base_size = 14) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b-%Y") +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.05))) +
+  labs(
+    title = "Evolução do Índice de Preços (IPCA) Nacional",
+    subtitle = "Unidade: pontos do índice acumulado",
+    x = "Data",
+    y = "IPCA (pontos do índice)"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+dev.off()
+cat("PDF IPCA nacional gerado em:", out_pdf_ipca, "\n")
+
+cat("\nConcluído: PDFs de séries per capita, população e IPCA gerados.\n")
+
+
+## 3. Rodando Controle Sintético - SP com Corte em Fev-23
+
+# =============================================================================
+# Controle Sintético (SP | Evento: fev/2023)
+# - Base: per capita (já criada previamente, sem extrapolação)
+# - Resultado: Premio_0114_pc (AJ)
+# - Preditoras: Consumo_Eletrico_pc, Consumo_Cimento_pc,
+#               Admissoes_pc, Demissoes_pc, Bolsa_Familia_pc
+# - Pré-período: inicia no 1º mês com SP completo (resultado + preditoras) e
+#                SP com Consumo_Cimento_pc não-NA
+# - Exports: CSV + XLSX (pesos, preditores, gaps)
+# =============================================================================
+
+# --- 0) Instalação / pacotes ---
+inst <- function(pkg) if (!require(pkg, character.only = TRUE)) install.packages(pkg, quiet = TRUE)
+inst("tidyverse"); inst("Synth"); inst("lubridate"); inst("readxl"); inst("openxlsx")
+suppressPackageStartupMessages({ library(tidyverse); library(Synth); library(lubridate); library(readxl); library(openxlsx) })
+
+# SCtools é opcional aqui (apenas se for usar placebos/plots adicionais)
+if (!require(SCtools, quietly = TRUE)) {
+  message("Pacote SCtools não é obrigatório para este script básico; seguindo sem ele.")
+}
+
+# --- 1) Input / Output paths ---
+in_xlsx  <- "/content/base_com_populacao_per_capita_v2.xlsx"
+if (!file.exists(in_xlsx)) {
+  alt <- "/base_com_populacao_per_capita_v2.xlsx"
+  if (file.exists(alt)) in_xlsx <- alt
+}
+stopifnot(file.exists(in_xlsx))
+
+out_dir  <- "/content"
+dir.create(out_dir, showWarnings = FALSE)
+out_weights_csv <- file.path(out_dir, "sc_SP_pesos_estados.csv")
+out_pred_csv    <- file.path(out_dir, "sc_SP_comparacao_preditores.csv")
+out_gaps_csv    <- file.path(out_dir, "sc_SP_gaps_series.csv")
+out_xlsx        <- file.path(out_dir, "sc_SP_resultados.xlsx")
+
+# --- 2) Ler base ---
+dados <- read_excel(in_xlsx) %>%
+  mutate(
+    Data = as.Date(Data),
+    UF   = toupper(as.character(UF))
+  )
+
+# --- 3) Definições do modelo ---
+variavel_resultado <- "Premio_0114_pc"  # AJ
+preditoras <- c("Consumo_Eletrico_pc","Consumo_Cimento_pc","Admissoes_pc","Demissoes_pc","Bolsa_Familia_pc")
+uf_tratada <- "SP"
+data_trat  <- as.Date("2023-02-01")     # chuvas fortes no litoral paulista (fev/2023)
+
+# Checagens mínimas
+miss_cols <- setdiff(c("UF","Data", variavel_resultado, preditoras), names(dados))
+if (length(miss_cols) > 0) stop("Colunas ausentes na base: ", paste(miss_cols, collapse=", "))
+
+# --- 4) Construir IDs e mapas ---
+dados_fmt <- dados %>%
+  arrange(UF, Data) %>%
+  mutate(unit_id = as.numeric(factor(UF)),
+         time_id = as.numeric(factor(Data)))
+
+map_uf_to_id   <- dados_fmt %>% distinct(UF, unit_id)
+map_time_to_dt <- dados_fmt %>% distinct(time_id, Data) %>% arrange(time_id)
+
+unidade_tratada_id    <- map_uf_to_id %>% filter(UF == uf_tratada) %>% pull(unit_id) %>% unique()
+unidades_controle_ids <- map_uf_to_id %>% filter(UF != uf_tratada) %>% pull(unit_id) %>% unique()
+
+periodo_tratamento_id <- map_time_to_dt %>% filter(Data == data_trat) %>% pull(time_id)
+if (length(periodo_tratamento_id) != 1) stop("Não encontrei time_id para 2023-02-01.")
+
+# --- 5) Início viável do pré-período (SP completo e cimento disponível) ---
+vars_necessarias_trat <- c(variavel_resultado, preditoras)
+
+primeira_data_sp_completo <- dados_fmt %>%
+  filter(UF == uf_tratada) %>%
+  arrange(Data) %>%
+  filter(if_all(all_of(vars_necessarias_trat), ~ !is.na(.))) %>%
+  slice(1) %>% pull(Data)
+if (length(primeira_data_sp_completo) == 0) stop("SP nunca tem todas as variáveis completas.")
+
+primeira_data_cimento_trat <- dados_fmt %>%
+  filter(UF == uf_tratada, !is.na(Consumo_Cimento_pc)) %>%
+  arrange(Data) %>% slice(1) %>% pull(Data)
+if (length(primeira_data_cimento_trat) == 0) stop("Consumo_Cimento_pc está todo NA em SP.")
+
+inicio_pre_data <- max(primeira_data_sp_completo, primeira_data_cimento_trat, na.rm = TRUE)
+start_time_id   <- map_time_to_dt %>% filter(Data == inicio_pre_data) %>% pull(time_id)
+
+# Último time_id com resultado de SP (limite do plot)
+end_time_id_trat <- dados_fmt %>%
+  filter(UF == uf_tratada, !is.na(.data[[variavel_resultado]])) %>%
+  summarise(max_id = max(time_id, na.rm = TRUE)) %>% pull(max_id)
+
+tempo_pre  <- seq(start_time_id, periodo_tratamento_id - 1)
+tempo_plot <- seq(start_time_id, end_time_id_trat)
+
+if (length(tempo_pre) < 3) warning("Pré-período curto; verifique disponibilidade de dados.")
+
+# --- 6) Sanity checks do tratado (SP) ---
+sp_dep_ok <- dados_fmt %>% filter(unit_id == unidade_tratada_id, time_id %in% tempo_plot) %>%
+  summarise(nn = sum(!is.na(.data[[variavel_resultado]]))) %>% pull(nn)
+if (sp_dep_ok != length(tempo_plot)) stop("SP tem NA no resultado dentro de time.plot.")
+
+sp_preds_ok <- dados_fmt %>% filter(unit_id == unidade_tratada_id, time_id %in% tempo_pre) %>%
+  summarise(across(all_of(preditoras), ~ all(!is.na(.)))) %>%
+  pivot_longer(everything(), names_to="pred", values_to="ok")
+if (any(!sp_preds_ok$ok)) stop("SP tem NA em preditoras no pré-período: ",
+                               paste(sp_preds_ok$pred[!sp_preds_ok$ok], collapse=", "))
+
+# --- 7) Filtrar doadores válidos ---
+controles_df <- dados_fmt %>% filter(unit_id %in% unidades_controle_ids)
+
+ctrl_ok_dep <- controles_df %>% filter(time_id %in% tempo_plot) %>%
+  group_by(unit_id) %>% summarise(ok_dep = all(!is.na(.data[[variavel_resultado]])), .groups="drop")
+
+ctrl_ok_preds <- controles_df %>% filter(time_id %in% tempo_pre) %>%
+  group_by(unit_id) %>% summarise(across(all_of(preditoras), ~ all(!is.na(.))), .groups="drop")
+
+ctrl_ok <- ctrl_ok_dep %>% inner_join(ctrl_ok_preds, by="unit_id") %>%
+  mutate(ok_all = ok_dep & if_all(all_of(preditoras), ~ .))
+
+valid_controls_ids <- ctrl_ok %>% filter(ok_all) %>% pull(unit_id)
+
+# relax (95% completude) se necessário
+if (length(valid_controls_ids) < 2) {
+  ctrl_relax <- controles_df %>% filter(time_id %in% tempo_pre) %>%
+    group_by(unit_id) %>% summarise(across(all_of(preditoras), ~ mean(!is.na(.)) >= 0.95), .groups="drop")
+  ctrl_ok_relax <- ctrl_ok_dep %>% inner_join(ctrl_relax, by="unit_id") %>%
+    mutate(ok_all = ok_dep & if_all(all_of(preditoras), ~ .))
+  valid_controls_ids <- ctrl_ok_relax %>% filter(ok_all) %>% pull(unit_id)
+}
+if (length(valid_controls_ids) < 2) {
+  stop("Doadores insuficientes após filtragem. Ajuste pré-período ou trate NAs.")
+}
+
+# --- 8) Remover preditoras problemáticas entre doadores ---
+pred_keep <- preditoras
+for (p in preditoras) {
+  ok_rate <- controles_df %>% filter(unit_id %in% valid_controls_ids, time_id %in% tempo_pre) %>%
+    summarise(rate = mean(!is.na(.data[[p]]))) %>% pull(rate)
+  if (is.na(ok_rate) || ok_rate < 0.95) pred_keep <- setdiff(pred_keep, p)
+}
+if (length(pred_keep) == 0) stop("Todas as preditoras têm muitos NAs entre doadores no pré-período.")
+if (length(pred_keep) < length(preditoras)) message("Removendo preditoras com muitos NAs: ",
+                                                   paste(setdiff(preditoras, pred_keep), collapse=", "))
+
+# --- 9) dataprep / synth ---
+dataprep_out <- dataprep(
+  foo                   = as.data.frame(dados_fmt),
+  predictors            = pred_keep,
+  predictors.op         = "mean",
+  time.predictors.prior = tempo_pre,
+  dependent             = variavel_resultado,
+  unit.variable         = "unit_id",
+  unit.names.variable   = "UF",
+  time.variable         = "time_id",
+  treatment.identifier  = unidade_tratada_id,
+  controls.identifier   = valid_controls_ids,
+  time.optimize.ssr     = tempo_pre,
+  time.plot             = tempo_plot
+)
+
+synth_out <- tryCatch(
+  synth(data.prep.obj = dataprep_out),
+  error = function(e) { stop("Falha em synth(): ", e$message) }
+)
+
+# --- 10) Plots ---
+cat("\nGerando gráfico de trajetórias (fev/2023)...\n")
+path.plot(
+  synth.res   = synth_out,
+  dataprep.res= dataprep_out,
+  Ylab        = "Prêmio 0114 per capita (ajustado)",
+  Xlab        = "Tempo (meses)",
+  Main        = "SP: Real vs. Sintético (Evento: fev/2023)",
+  Legend      = c("SP (Real)","SP (Sintético)"),
+  tr.intake   = periodo_tratamento_id
+)
+
+cat("\nGerando gráfico de diferenças (gap)...\n")
+gaps.plot(
+  synth.res   = synth_out,
+  dataprep.res= dataprep_out,
+  Ylab        = "Gap (Real - Sintético)",
+  Xlab        = "Tempo (meses)",
+  Main        = "Gap em 0114 per capita (SP) — fev/2023",
+  tr.intake   = periodo_tratamento_id
+)
+
+# --- 11) Tabelas e export ---
+tabs <- synth.tab(dataprep.res = dataprep_out, synth.res = synth_out)
+
+# Pesos (tab.w) e Preditores (tab.pred)
+pesos <- tabs$tab.w %>% as_tibble()
+preds <- tabs$tab.pred %>% as_tibble(rownames = "variavel")
+
+# Série de gaps (real - sintético)
+gap_df <- tibble(
+  time_id = dataprep_out$tag$time.plot,
+  Data    = map_time_to_dt$Data[match(dataprep_out$tag$time.plot, map_time_to_dt$time_id)],
+  gap     = dataprep_out$Y1plot - (dataprep_out$Y0plot %*% synth_out$solution.w)
+)
+
+write.csv(pesos, out_weights_csv, row.names = FALSE)
+write.csv(preds, out_pred_csv,    row.names = FALSE)
+write.csv(gap_df, out_gaps_csv,   row.names = FALSE)
+
+wb <- createWorkbook()
+addWorksheet(wb, "Pesos");      writeData(wb, "Pesos", pesos)
+addWorksheet(wb, "Preditores"); writeData(wb, "Preditores", preds)
+addWorksheet(wb, "Gaps");       writeData(wb, "Gaps", gap_df)
+saveWorkbook(wb, out_xlsx, overwrite = TRUE)
+
+cat("\nArquivos gerados em ", out_dir, ":\n",
+    "- ", basename(out_weights_csv), "\n",
+    "- ", basename(out_pred_csv), "\n",
+    "- ", basename(out_gaps_csv), "\n",
+    "- ", basename(out_xlsx), "\n", sep = "")
+
+## 3.1 Adaptações para calcular P-Valor
+
+# =============================================================================
+# Controle Sintético (SP | Evento: fev/2023) com Testes de Placebo
+# - Base: per capita (já criada previamente, sem extrapolação)
+# - Resultado: Premio_0114_pc (AJ)
+# - Preditoras: Consumo_Eletrico_pc, Consumo_Cimento_pc,
+#               Admissoes_pc, Demissoes_pc, Bolsa_Familia_pc
+# - LÓGICA DE INFERÊNCIA: Testes de Placebo (Randomization Inference)
+# =============================================================================
+
+# --- 0) Instalação / pacotes ---
+inst <- function(pkg) if (!require(pkg, character.only = TRUE)) install.packages(pkg, quiet = TRUE)
+inst("tidyverse"); inst("Synth"); inst("lubridate"); inst("readxl"); inst("openxlsx")
+suppressPackageStartupMessages({ library(tidyverse); library(Synth); library(lubridate); library(readxl); library(openxlsx) })
+
+# --- 1) Input / Output paths ---
+
+in_xlsx  <- "/content/base_com_populacao_per_capita_v2.xlsx"
+if (!file.exists(in_xlsx)) {
+
+  alt <- "base_final_preview.v7.xlsx" # Adapte se o nome do seu arquivo for diferente
+  if (file.exists(alt)) in_xlsx <- alt
+}
+stopifnot(file.exists(in_xlsx))
+
+out_dir      <- "/content/resultados_sintetico"
+dir.create(out_dir, showWarnings = FALSE)
+out_xlsx     <- file.path(out_dir, "sc_SP_resultados_principais.xlsx")
+out_placebo_gaps_png <- file.path(out_dir, "sc_SP_placebo_gaps.png")
+out_placebo_rmspe_png <- file.path(out_dir, "sc_SP_placebo_rmspe_ratio.png")
+
+# --- 2) Ler e preparar base ---
+dados <- read_excel(in_xlsx) %>%
+  mutate(
+    Data = as.Date(Data),
+    UF   = toupper(as.character(UF))
+  ) %>%
+  arrange(UF, Data) %>%
+  mutate(unit_id = as.numeric(factor(UF)),
+         time_id = as.numeric(factor(Data, levels = sort(unique(Data)))))
+
+# --- 3) Definições do modelo ---
+variavel_resultado <- "Premio_0114_pc"
+preditoras <- c("Consumo_Eletrico_pc","Consumo_Cimento_pc","Admissoes_pc","Demissoes_pc","Bolsa_Familia_pc")
+uf_tratada <- "SP"
+data_trat  <- as.Date("2023-02-01")
+
+# --- 4) Mapeamentos e IDs ---
+map_uf_to_id   <- dados %>% distinct(UF, unit_id)
+map_time_to_dt <- dados %>% distinct(time_id, Data) %>% arrange(time_id)
+id_tratado     <- map_uf_to_id %>% filter(UF == uf_tratada) %>% pull(unit_id)
+id_trat_time   <- map_time_to_dt %>% filter(Data == data_trat) %>% pull(time_id)
+
+# --- 5) Período de análise ---
+# Encontrar a data de início mais tardia onde a UF tratada tem dados completos
+start_date <- dados %>%
+  filter(UF == uf_tratada) %>%
+  filter(if_all(all_of(c(variavel_resultado, preditoras)), ~ !is.na(.))) %>%
+  summarise(start = min(Data, na.rm = TRUE)) %>%
+  pull(start)
+
+id_start_time <- map_time_to_dt %>% filter(Data == start_date) %>% pull(time_id)
+ids_pre_trat  <- seq(id_start_time, id_trat_time - 1)
+ids_plot_time <- seq(id_start_time, max(map_time_to_dt$time_id))
+
+# --- 6) Identificar todas as UFs válidas para o loop de placebo ---
+ufs_completas_pre <- dados %>%
+  filter(time_id %in% ids_pre_trat) %>%
+  group_by(UF) %>%
+  summarise(
+    preds_ok = all(!is.na(across(all_of(preditoras)))),
+    .groups = "drop"
+  )
+
+ufs_completas_pos <- dados %>%
+  filter(time_id %in% ids_plot_time) %>%
+  group_by(UF) %>%
+  summarise(
+    dep_ok = all(!is.na(.data[[variavel_resultado]])),
+    .groups = "drop"
+  )
+
+ufs_validas <- inner_join(ufs_completas_pre, ufs_completas_pos, by = "UF") %>%
+  filter(preds_ok & dep_ok) %>%
+  pull(UF)
+
+ids_unidades_validas <- map_uf_to_id %>% filter(UF %in% ufs_validas) %>% pull(unit_id)
+
+cat("Unidade tratada:", uf_tratada, "(ID:", id_tratado, ")\n")
+cat(length(ufs_validas) - 1, "unidades de controle válidas para o teste de placebo.\n\n")
+
+# --- 7) Função para rodar o Controle Sintético para uma unidade ---
+run_synth <- function(target_id, control_ids, df) {
+  cat("Processando unidade ID:", target_id, "...\n")
+
+  # Garante que a unidade alvo não esteja no grupo de controle
+  controls_identifier <- setdiff(control_ids, target_id)
+
+  # Tenta rodar a análise, tratando erros
+  result <- tryCatch({
+    dataprep_out <- dataprep(
+      foo = as.data.frame(df),
+      predictors = preditoras,
+      predictors.op = "mean",
+      time.predictors.prior = ids_pre_trat,
+      dependent = variavel_resultado,
+      unit.variable = "unit_id",
+      unit.names.variable = "UF",
+      time.variable = "time_id",
+      treatment.identifier = target_id,
+      controls.identifier = controls_identifier,
+      time.optimize.ssr = ids_pre_trat,
+      time.plot = ids_plot_time
+    )
+
+    synth_out <- synth(data.prep.obj = dataprep_out, quadopt = "ipop")
+
+    # Extrai os dados
+    tibble(
+      unit_id = target_id,
+      time_id = ids_plot_time,
+      real_y = as.numeric(dataprep_out$Y1plot),
+      synth_y = as.numeric(dataprep_out$Y0plot %*% synth_out$solution.w)
+    )
+  }, error = function(e) {
+    cat("  -> ERRO ao processar ID", target_id, ":", e$message, "\n")
+    return(NULL) # Retorna nulo em caso de falha
+  })
+
+  return(result)
+}
+
+# --- 8) Loop de Placebo ---
+# Itera sobre todas as unidades válidas (incluindo a tratada)
+placebo_results <- lapply(ids_unidades_validas, function(id) {
+  run_synth(target_id = id, control_ids = ids_unidades_validas, df = dados)
+})
+
+# Combina todos os resultados em um único dataframe
+gaps_df <- bind_rows(placebo_results) %>%
+  left_join(map_time_to_dt, by = "time_id") %>%
+  left_join(map_uf_to_id, by = "unit_id") %>%
+  mutate(gap = real_y - synth_y)
+
+# --- 9) Cálculo da Significância (RMSPE) ---
+rmspe_df <- gaps_df %>%
+  mutate(periodo = ifelse(time_id >= id_trat_time, "pos", "pre")) %>%
+  group_by(UF, periodo) %>%
+  summarise(rmspe = sqrt(mean(gap^2)), .groups = "drop") %>%
+  pivot_wider(names_from = periodo, values_from = rmspe) %>%
+  mutate(rmspe_ratio = pos / pre) %>%
+  arrange(desc(rmspe_ratio)) %>%
+  mutate(rank = row_number())
+
+p_valor <- rmspe_df %>%
+  filter(UF == uf_tratada) %>%
+  summarise(p_value = rank / n_distinct(rmspe_df$UF)) %>%
+  pull(p_value)
+
+cat("\n--- Resultados de Significância ---\n")
+print(as.data.frame(rmspe_df))
+cat("\nO P-Valor para", uf_tratada, "é:", round(p_valor, 4), "\n")
+cat("----------------------------------\n\n")
+
+# --- 10) Novos Gráficos de Placebo ---
+# Gráfico de Gaps ("Spaghetti Plot")
+g_gaps <- ggplot(gaps_df, aes(x = Data, y = gap, group = UF)) +
+  geom_line(data = filter(gaps_df, UF != uf_tratada), color = "grey80") +
+  geom_line(data = filter(gaps_df, UF == uf_tratada), color = "black", linewidth = 1) +
+  geom_vline(xintercept = data_trat, linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dotted") +
+  labs(
+    title = paste("Impacto em SP vs. Placebos (", variavel_resultado, ")", sep=""),
+    subtitle = paste("SP (preto) vs. Outras UFs (cinza) | P-Valor =", round(p_valor, 3)),
+    x = "Data", y = "Gap (Real - Sintético)"
+  ) +
+  theme_minimal()
+
+ggsave(out_placebo_gaps_png, g_gaps, width = 10, height = 6)
+print(g_gaps)
+
+# Histograma da Razão de RMSPE
+g_rmspe <- ggplot(rmspe_df, aes(x = rmspe_ratio)) +
+  geom_histogram(fill = "grey80", color = "black", bins = 15) +
+  geom_vline(
+    xintercept = filter(rmspe_df, UF == uf_tratada) %>% pull(rmspe_ratio),
+    color = "red", linetype = "dashed", linewidth = 1
+  ) +
+  labs(
+    title = "Distribuição da Razão de RMSPE (Pós / Pré)",
+    subtitle = paste("Posição de SP (linha vermelha):", filter(rmspe_df, UF == uf_tratada)$rank, "de", nrow(rmspe_df)),
+    x = "Razão RMSPE (Pós / Pré)", y = "Frequência (Nº de UFs)"
+  ) +
+  theme_minimal()
+
+ggsave(out_placebo_rmspe_png, g_rmspe, width = 10, height = 6)
+print(g_rmspe)
+
+# --- 11) Salvar Resultados Principais (Apenas de SP) ---
+# Roda a análise uma última vez apenas para SP para obter os pesos e preditores
+sp_analysis <- dataprep(
+    foo = as.data.frame(dados), predictors = preditoras, predictors.op = "mean",
+    time.predictors.prior = ids_pre_trat, dependent = variavel_resultado,
+    unit.variable = "unit_id", unit.names.variable = "UF", time.variable = "time_id",
+    treatment.identifier = id_tratado,
+    controls.identifier = setdiff(ids_unidades_validas, id_tratado),
+    time.optimize.ssr = ids_pre_trat, time.plot = ids_plot_time
+)
+sp_synth <- synth(data.prep.obj = sp_analysis)
+tabs <- synth.tab(dataprep.res = sp_analysis, synth.res = sp_synth)
+
+pesos <- as_tibble(tabs$tab.w)
+preds <- as_tibble(tabs$tab.pred, rownames = "variavel")
+gaps_sp <- filter(gaps_df, UF == uf_tratada) %>% select(Data, UF, real_y, synth_y, gap)
+
+wb <- createWorkbook()
+addWorksheet(wb, "Pesos"); writeData(wb, "Pesos", pesos)
+addWorksheet(wb, "Preditores"); writeData(wb, "Preditores", preds)
+addWorksheet(wb, "Gaps_SP"); writeData(wb, "Gaps_SP", gaps_sp)
+addWorksheet(wb, "RMSPE_Todos"); writeData(wb, "RMSPE_Todos", rmspe_df)
+saveWorkbook(wb, out_xlsx, overwrite = TRUE)
+
+cat("Análise concluída. Resultados salvos em:", out_dir, "\n")
+
+## 3.2 Testes de Robustez Adicionais
+
+# =============================================================================
+
+cat("\n--- INICIANDO BLOCO 2: TESTES DE ROBUSTEZ ---\n\n")
+
+# --- 1) Verificação do Balanço dos Preditores ---
+# Objetivo: Verificar se o "SP Sintético" era de fato parecido com o SP real
+# ANTES do evento, com base nas variáveis econômicas (preditoras).
+
+cat("--- Teste 1: Tabela de Balanço dos Preditores ---\n")
+
+# A função synth.tab() já criou essa tabela para nós na análise principal.
+# Vamos apenas formatá-la para uma visualização clara.
+tabela_balanco <- synth.tab(dataprep.res = sp_analysis, synth.res = sp_synth)$tab.pred %>%
+  as_tibble(rownames = "Variavel") %>%
+  select(
+    Variavel,
+    SP_Real = Treated,
+    SP_Sintetico = Synthetic,
+
+    Media_Controles = `Sample Mean`
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(., 3)))
+
+# Imprime a tabela de comparação no console.
+# O ideal é que os valores nas colunas "SP_Real" e "SP_Sintetico" sejam muito próximos.
+print("Comparação das médias das variáveis preditoras no período pré-tratamento:")
+print(as.data.frame(tabela_balanco))
+cat("\n\n")
+
+
+# --- 2) Teste de Falsificação com Placebo no Tempo ---
+# Objetivo: Rodar a análise em uma data "falsa" no passado, onde sabemos que
+# não houve evento. Se encontrarmos um efeito aqui, nosso modelo é suspeito.
+
+cat("--- Teste 2: Placebo no Tempo (Evento Falso em fev/2022) ---\n")
+
+# Define a data do tratamento placebo
+data_trat_placebo <- as.Date("2022-02-01")
+id_trat_time_placebo <- map_time_to_dt %>% filter(Data == data_trat_placebo) %>% pull(time_id)
+
+# Redefine os períodos de pré-tratamento e de plot com base na nova data
+ids_pre_trat_placebo  <- seq(id_start_time, id_trat_time_placebo - 1)
+ids_plot_time_placebo <- seq(id_start_time, max(map_time_to_dt$time_id))
+
+# Roda o dataprep para o teste de placebo no tempo
+placebo_in_time_prep <- dataprep(
+  foo = as.data.frame(dados),
+  predictors = preditoras,
+  predictors.op = "mean",
+  time.predictors.prior = ids_pre_trat_placebo,
+  dependent = variavel_resultado,
+  unit.variable = "unit_id",
+  unit.names.variable = "UF",
+  time.variable = "time_id",
+  treatment.identifier = id_tratado,
+  controls.identifier = setdiff(ids_unidades_validas, id_tratado),
+  time.optimize.ssr = ids_pre_trat_placebo,
+  time.plot = ids_plot_time_placebo
+)
+
+# Roda o synth para o teste de placebo no tempo
+placebo_in_time_synth <- synth(data.prep.obj = placebo_in_time_prep)
+
+# Gera o gráfico de trajetórias para este teste
+# O ideal é que as linhas (Real e Sintético) NÃO se separem após a linha
+# pontilhada do evento falso.
+cat("Gerando gráfico para o teste de placebo no tempo...\n")
+path.plot(
+  synth.res = placebo_in_time_synth,
+  dataprep.res = placebo_in_time_prep,
+  Ylab = variavel_resultado, Xlab = "Tempo",
+  Main = "Teste Placebo no Tempo (Evento Falso em fev/2022)",
+  tr.intake = id_trat_time_placebo
+)
+cat("Observe o gráfico gerado. Idealmente, não deve haver um 'gap' significativo.\n\n\n")
+
+# --- Adição ao Teste 2: Cálculo Quantitativo do Placebo no Tempo ---
+
+cat("Calculando a razão de MSPE para o teste de placebo no tempo...\n")
+
+# Extrai os gaps (diferença entre real e sintético) do resultado do placebo
+gaps_placebo_tempo <- placebo_in_time_prep$Y1plot - (placebo_in_time_prep$Y0plot %*% placebo_in_time_synth$solution.w)
+
+# Calcula o MSPE (Mean Squared Prediction Error) antes e depois do evento falso
+mspe_pre_placebo <- mean(gaps_placebo_tempo[1:length(ids_pre_trat_placebo)]^2)
+mspe_pos_placebo <- mean(gaps_placebo_tempo[(length(ids_pre_trat_placebo)+1):length(gaps_placebo_tempo)]^2)
+
+# Calcula a razão
+razao_mspe_placebo <- mspe_pos_placebo / mspe_pre_placebo
+
+# Imprime os resultados
+cat("MSPE Pré-Tratamento (até jan/2022):", round(mspe_pre_placebo, 5), "\n")
+cat("MSPE Pós-Tratamento (após fev/2022):", round(mspe_pos_placebo, 5), "\n")
+cat("Razão MSPE (Pós / Pré) para o evento falso:", round(razao_mspe_placebo, 3), "\n\n")
+
+# Compara com a razão do evento real de SP
+razao_sp_real <- rmspe_df %>% filter(UF == uf_tratada) %>% pull(rmspe_ratio)
+cat("Para referência, a razão de RMSPE de SP no evento real foi:", round(razao_sp_real, 3), "\n")
+
+
+# --- 3) Análise de Sensibilidade do "Donor Pool" (Leave-One-Out) ---
+# Objetivo: Verificar se o resultado de SP é robusto e não depende excessivamente
+# de um único estado no grupo de controle.
+
+cat("--- Teste 3: Análise de Sensibilidade 'Leave-One-Out' ---\n")
+
+# Pega os pesos da análise original de SP para ver os principais contribuidores
+pesos_originais <- synth.tab(dataprep.res = sp_analysis, synth.res = sp_synth)$tab.w %>%
+  as_tibble() %>%
+  arrange(desc(w.weights))
+
+# Seleciona os 3 principais contribuidores para o teste
+doadores_principais_uf <- head(pesos_originais$unit.names, 3)
+doadores_principais_id <- map_uf_to_id %>% filter(UF %in% doadores_principais_uf) %>% pull(unit_id)
+
+cat("MSPE original de SP:", round(sp_synth$loss.v, 5), "\n")
+cat("Testando a robustez removendo os 3 principais doadores:", paste(doadores_principais_uf, collapse=", "), "\n\n")
+
+# Loop: Roda a análise para SP removendo um doador principal de cada vez
+for (i in 1:length(doadores_principais_id)) {
+
+  id_para_remover <- doadores_principais_id[i]
+  uf_removida <- doadores_principais_uf[i]
+
+  # Cria um novo grupo de controle sem o doador principal
+  controles_loo <- setdiff(ids_unidades_validas, c(id_tratado, id_para_remover))
+
+  # Roda dataprep e synth com o grupo de controle modificado
+  loo_prep <- dataprep(
+    foo = as.data.frame(dados), predictors = preditoras, predictors.op = "mean",
+    time.predictors.prior = ids_pre_trat, dependent = variavel_resultado,
+    unit.variable = "unit_id", time.variable = "time_id", treatment.identifier = id_tratado,
+    controls.identifier = controles_loo, time.optimize.ssr = ids_pre_trat,
+    time.plot = ids_plot_time
+  )
+  loo_synth <- synth(data.prep.obj = loo_prep)
+
+  # Compara o novo MSPE (erro de ajuste) com o original
+  cat("Resultado removendo '", uf_removida, "': Novo MSPE = ", round(loo_synth$loss.v, 5), "\n", sep="")
+}
+
+cat("\nCompare os novos MSPEs com o original. Se os valores mudarem drasticamente, o resultado é sensível àquele doador.\n")
+cat("Um resultado robusto não deve sofrer grandes alterações.\n\n\n")
+
+
+# --- 4) Análise da Qualidade do Ajuste Pré-Tratamento (Visual) ---
+# Objetivo: Re-examinar visualmente o quão bem o SP Sintético imitou o SP
+# real ANTES do evento na análise principal.
+
+cat("--- Teste 4: Verificação Visual do Ajuste Pré-Tratamento ---\n")
+
+cat("Gerando novamente o gráfico principal de trajetórias para inspeção...\n")
+# O gráfico original é o melhor para esta análise.
+path.plot(
+  synth.res = sp_synth,
+  dataprep.res = sp_analysis,
+  Ylab = variavel_resultado, Xlab = "Tempo",
+  Main = "Verificação do Ajuste: SP Real vs. SP Sintético",
+  tr.intake = id_trat_time
+)
+cat("Inspecione o gráfico gerado. Foque no período ANTES da linha pontilhada.\n")
+cat("As duas linhas (Real e Sintético) devem estar o mais sobrepostas possível nesse período.\n")
+cat("Um bom ajuste pré-tratamento é condição necessária para a validade do método.\n\n")
+
+cat("--- FIM DO BLOCO DE TESTES DE ROBUSTEZ ---\n")
+
